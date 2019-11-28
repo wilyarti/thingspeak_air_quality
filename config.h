@@ -11,9 +11,6 @@
 #define CO2_RX 12
 #define CO2_TX 14
 
-#define SCL 5
-#define SDA 4
-
 // ota updater stuff
 const String VERSION = "1";
 
