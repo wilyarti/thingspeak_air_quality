@@ -3,13 +3,6 @@
    github.com/wilyarti
    License BSD 2
 */
-#include <EEPROM.h>
-#include <ThingSpeak.h>
-#include <time.h>
-#include <Wire.h>
-#include "Adafruit_SHT31.h"
-#include "config.h"
-
 // ota includes
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
@@ -22,19 +15,23 @@
 #include <Ticker.h>
 // ----
 
-// ota updater stuff
-const String VERSION = "1";
+// Sensor includes
+#include <ThingSpeak.h>
+#include <time.h>
+#include <Arduino.h>
+#include <Wire.h>
+#include "Adafruit_SHT31.h"
+#include "config.h"
+#include <SoftwareSerial.h>
+#include <MHZ.h>
 
-#define LED_PIN 2 // gpio2 for ESP-12, gpio1 for ESP-01
-
-#define METADATA_CHK_SECS 24 * 60 * 60 // Check for updated config metadata once a day
 
 // this is the config persisted to EEPROM so retained over power offs
 typedef struct {
     String thingSpeakChannel;
     String thingSpeakKey;
-    int    publishInterval;
-    int    initializedFlag;
+    int publishInterval;
+    int initializedFlag;
 } _Config;
 
 _Config theConfig;
@@ -46,8 +43,6 @@ typedef struct {
 } _rtcStore;
 
 _rtcStore rtcStore;
-
-#define INITIALIZED_MARKER 7216
 Ticker ledBlinker;
 
 // global variables
@@ -56,31 +51,28 @@ int measureCount = 0;
 unsigned long curTime;
 bool justWokeUp = true;
 
-// Rain variables
-extern volatile unsigned int rainEventCount = 0;
-extern unsigned int lastRainEvent = 0;
-extern float rainScaleMM = 0.2794;
-
-
 // initialise functions
 WiFiClient client;
 Adafruit_SHT31 sht31 = Adafruit_SHT31();
 
-void setup() {
-    Serial.begin(115200);
+MHZ co2(CO2_RX, CO2_TX, A0, MHZ19B);
 
+void setup() {
+    pinMode(LED_PIN, OUTPUT);
+    Serial.begin(115200);
     Serial.println("Loading config...");
     loadConfig();
     Serial.println("Connecting to Wifi...");
     if (WiFi.waitForConnectResult() != WL_CONNECTED) {
         // fast blink LED while Wifi manager running config AP
-        ledBlinker.attach(0.2, []() {
+        ledBlinker.attach(1, []() {
             digitalWrite(LED_PIN, !digitalRead(LED_PIN));
         });
         doWifiManager();
         ledBlinker.detach();
         digitalWrite(LED_PIN, HIGH); // off
     }
+
     Serial.println();
     Serial.print("Firmware version: ");
     Serial.println(VERSION);
@@ -98,11 +90,28 @@ void setup() {
         delay(1000);
     }
 
-    if(justWokeUp) {
+    if (justWokeUp) {
         updateConfigFromChannelMetadata();
         justWokeUp = false;
     }
 
+    // Warm Up - CO2 monitor
+    // enable debug to get addition information
+    co2.setDebug(true);
+    ledBlinker.attach(0.05, []() {
+        digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+    });
+    if (co2.isPreHeating()) {
+        Serial.print("Preheating");
+        while (co2.isPreHeating()) {
+            // fast blink LED while Wifi manager running config AP
+            Serial.print(".");
+            delay(5000);
+        }
+        Serial.println();
+    }
+    ledBlinker.detach();
+    digitalWrite(LED_PIN, HIGH); // off
 }
 
 void loop() {
@@ -112,7 +121,12 @@ void loop() {
     }
 
     Serial.println("Measuring...");
+    ledBlinker.attach(0.5, []() {
+        digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+    });
     measure();
+    ledBlinker.detach();
+    digitalWrite(LED_PIN, HIGH); // off
 
     Serial.println("Going to sleep...");
     goToSleep();
@@ -133,9 +147,11 @@ void goToSleep() {
 void measure() {
     float t1(NAN);
     float h1(NAN);
+    int ppm_uart = -5;
+
     // sht31
-     t1 = sht31.readTemperature();
-     h1 = sht31.readHumidity();
+    t1 = sht31.readTemperature();
+    h1 = sht31.readHumidity();
 
     if (!isnan(t1)) {  // check if 'is not a number'
         Serial.print("Temp *C = ");
@@ -151,17 +167,19 @@ void measure() {
         Serial.println("Failed to read humidity");
     }
 
+    // ppm
+    ppm_uart = co2.readCO2UART();
+    Serial.print("PPMuart: ");
+    Serial.print(ppm_uart);
     // wifi
     float rssi = WiFi.RSSI();
 
     String url = String("http://api.thingspeak.com/update?api_key=") + theConfig.thingSpeakKey +
                  "&field1=" + t1 +
-                 "&field2=" + p +
-                 "&field3=" + h1 +
-                 "&field4=" + volt +
-                 "&field5=" + rssi
-                 + "&field6=" + measureCount
-    ;
+                 "&field2=" + h1 +
+                 "&field3=" + ppm_uart +
+                 "&field4=" + rssi
+                 + "&field5=" + measureCount;
 
 
     Serial.println(url);
@@ -192,16 +210,20 @@ void doWakeupCount() {
 
     system_rtc_mem_write(65, &rtcStore, sizeof(rtcStore));
 
-    Serial.print("doWakeupCount: rtcStore.initializedFlag="); Serial.print(rtcStore.initializedFlag);
-    Serial.print(", rtcStore.wakeupCounter="); Serial.println(rtcStore.wakeupCounter);
+    Serial.print("doWakeupCount: rtcStore.initializedFlag=");
+    Serial.print(rtcStore.initializedFlag);
+    Serial.print(", rtcStore.wakeupCounter=");
+    Serial.println(rtcStore.wakeupCounter);
 }
 
 bool shouldSaveConfig = false;
 
 void doWifiManager() {
-    WiFiManagerParameter custom_thingspeak_channel("channel", "ThingSpeak Channel", theConfig.thingSpeakChannel.c_str(), 9);
+    WiFiManagerParameter custom_thingspeak_channel("channel", "ThingSpeak Channel", theConfig.thingSpeakChannel.c_str(),
+                                                   9);
     WiFiManagerParameter custom_thingspeak_key("key", "ThingSpeak Key", theConfig.thingSpeakKey.c_str(), 17);
-    WiFiManagerParameter custom_publish_interval("publishInterval", "Publish Interval", String(theConfig.publishInterval).c_str(), 6);
+    WiFiManagerParameter custom_publish_interval("publishInterval", "Publish Interval",
+                                                 String(theConfig.publishInterval).c_str(), 6);
 
     WiFiManager wifiManager;
 
@@ -247,12 +269,15 @@ void doWifiManager() {
 }
 
 void updateConfigFromChannelMetadata() {
-    String url = String("http://api.thingspeak.com/channels/") + theConfig.thingSpeakChannel + "/feeds.json?metadata=true&results=0";
-    Serial.print("updateConfigFromChannelMetadata: "); Serial.println(url);
+    String url = String("http://api.thingspeak.com/channels/") + theConfig.thingSpeakChannel +
+                 "/feeds.json?metadata=true&results=0";
+    Serial.print("updateConfigFromChannelMetadata: ");
+    Serial.println(url);
     HTTPClient http;
     http.begin(url);
     int httpCode = http.GET();
-    Serial.print("updateConfigFromChannelMetadata httpCode: ");  Serial.println(httpCode);
+    Serial.print("updateConfigFromChannelMetadata httpCode: ");
+    Serial.println(httpCode);
     String payload = http.getString();
     http.end();
     if (payload.length() < 1) {
@@ -260,25 +285,31 @@ void updateConfigFromChannelMetadata() {
     }
 
     StaticJsonBuffer<1024> jsonBuffer;
-    JsonObject& root = jsonBuffer.parseObject(payload);
+    JsonObject &root = jsonBuffer.parseObject(payload);
     if (!root.success()) {
         Serial.print("updateConfigFromChannelMetadata: payload parse FAILED: ");
-        Serial.print("payload: "); Serial.println(payload);
+        Serial.print("payload: ");
+        Serial.println(payload);
         return;
     }
-    Serial.print("updateConfigFromChannelMetadata: payload parse OK: "); root.prettyPrintTo(Serial); Serial.println();
+    Serial.print("updateConfigFromChannelMetadata: payload parse OK: ");
+    root.prettyPrintTo(Serial);
+    Serial.println();
 
     String metaDate = root["channel"]["metadata"];
     Serial.println(metaDate);
 
     StaticJsonBuffer<500> jsonBuffer2;
-    JsonObject& md = jsonBuffer2.parseObject(metaDate);
+    JsonObject &md = jsonBuffer2.parseObject(metaDate);
     if (!md.success()) {
         Serial.print("updateConfigFromChannelMetadata: md parse FAILED: ");
-        Serial.print("updateConfigFromChannelMetadata: md: "); Serial.println(metaDate);
+        Serial.print("updateConfigFromChannelMetadata: md: ");
+        Serial.println(metaDate);
         return;
     }
-    Serial.print("updateConfigFromChannelMetadata: metaDate parse OK: "); md.prettyPrintTo(Serial); Serial.println();
+    Serial.print("updateConfigFromChannelMetadata: metaDate parse OK: ");
+    md.prettyPrintTo(Serial);
+    Serial.println();
 
     boolean configUpdated = false;
     if (md.containsKey("publishInterval")) {
@@ -324,32 +355,41 @@ void saveConfig() {
 
     EEPROM.commit();
 
-    Serial.println("Config saved:"); printConfig();
+    Serial.println("Config saved:");
+    printConfig();
 }
 
 void loadConfig() {
     EEPROM.begin(512);
 
     int addr = 0;
-    EEPROM.get(addr, theConfig.initializedFlag);            addr += sizeof(theConfig.publishInterval);
+    EEPROM.get(addr, theConfig.initializedFlag);
+    addr += sizeof(theConfig.publishInterval);
     if (theConfig.initializedFlag != INITIALIZED_MARKER) {
         Serial.println("*** No config!");
         return;
     }
 
-    theConfig.thingSpeakChannel = eepromReadString(addr);   addr += theConfig.thingSpeakChannel.length() + 1;
-    theConfig.thingSpeakKey = eepromReadString(addr);       addr += theConfig.thingSpeakKey.length() + 1;
-    EEPROM.get(addr, theConfig.publishInterval);            addr += sizeof(theConfig.publishInterval);
+    theConfig.thingSpeakChannel = eepromReadString(addr);
+    addr += theConfig.thingSpeakChannel.length() + 1;
+    theConfig.thingSpeakKey = eepromReadString(addr);
+    addr += theConfig.thingSpeakKey.length() + 1;
+    EEPROM.get(addr, theConfig.publishInterval);
+    addr += sizeof(theConfig.publishInterval);
 
     EEPROM.commit();
 
-    Serial.println("Config loaded: "); printConfig();
+    Serial.println("Config loaded: ");
+    printConfig();
 }
 
 void printConfig() {
-    Serial.print("ThingSpeak channel: '"); Serial.print(theConfig.thingSpeakChannel);
-    Serial.print("', ThingSpeak Key="); Serial.print(theConfig.thingSpeakKey);
-    Serial.print(", publishInterval="); Serial.print(theConfig.publishInterval);
+    Serial.print("ThingSpeak channel: '");
+    Serial.print(theConfig.thingSpeakChannel);
+    Serial.print("', ThingSpeak Key=");
+    Serial.print(theConfig.thingSpeakKey);
+    Serial.print(", publishInterval=");
+    Serial.print(theConfig.publishInterval);
     Serial.println();
 }
 
@@ -373,12 +413,15 @@ String eepromReadString(int addr) {
 }
 
 void doFirmwareUpdate(String firmwareUrl) {
-    Serial.print("doFirmwareUpdate: from "); Serial.println(firmwareUrl);
+    Serial.print("doFirmwareUpdate: from ");
+    Serial.println(firmwareUrl);
 
     t_httpUpdate_return ret = ESPhttpUpdate.update(firmwareUrl);
     switch (ret) {
         case HTTP_UPDATE_FAILED:
-            Serial.print("doFirmwareUpdate: HTTP_UPDATE_FAILD Error :"); Serial.print(ESPhttpUpdate.getLastError()); Serial.println(ESPhttpUpdate.getLastErrorString());
+            Serial.print("doFirmwareUpdate: HTTP_UPDATE_FAILD Error :");
+            Serial.print(ESPhttpUpdate.getLastError());
+            Serial.println(ESPhttpUpdate.getLastErrorString());
             break;
 
         case HTTP_UPDATE_NO_UPDATES:

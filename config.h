@@ -12,4 +12,12 @@
 #define CO2_TX 14
 
 #define SCL 5
-#define SDA 
+#define SDA 4
+
+// ota updater stuff
+const String VERSION = "1";
+
+#define LED_PIN 16 // ESP M2 Strong has LED on GPIO 16.
+#define INITIALIZED_MARKER 7216
+
+#define METADATA_CHK_SECS 24 * 60 * 60 // Check for updated config metadata once a day
